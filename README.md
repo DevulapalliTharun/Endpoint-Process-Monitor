@@ -86,9 +86,6 @@ endpoint-monitor/
 │   ├── train.py                  ← Offline baseline training on collected data
 │   └── requirements.txt
 │
-├── explanations/
-│   └── challenges_faced.md       ← Technical challenges + interview Q&A
-│
 ├── logs/
 │   ├── metrics.json              ← Live process metrics (written by C++)
 │   └── alerts.log                ← Anomaly alerts with timestamps
