@@ -240,9 +240,9 @@ python3 -m venv .venv
 
 This project mirrors the core instrumentation layer of commercial EDR and UEM platforms:
 
-- **Omnissa Workspace ONE** — monitors endpoint health and compliance
 - **CrowdStrike Falcon** — process-level behavioral detection
 - **Microsoft Defender for Endpoint** — `/proc`-equivalent telemetry on Linux agents
+- **Datadog Agent** — continuous per-process metrics and anomaly alerting
 
 The difference: those run at kernel driver level. This runs at userspace — but the **data model and detection logic are identical**.
 
