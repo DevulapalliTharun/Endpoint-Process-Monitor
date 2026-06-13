@@ -1,0 +1,17 @@
+# compiled binary
+monitor
+*.o
+
+# runtime logs — regenerated every run, no point committing them
+logs/*.json
+logs/*.log
+
+# trained models
+ml/*.joblib
+
+# python cache + virtualenv
+__pycache__/
+.venv/
+
+# personal interview prep — not for the repo
+explanations/
