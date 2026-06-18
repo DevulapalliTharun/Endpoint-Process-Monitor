@@ -6,9 +6,9 @@ logs/metrics.json. This script tails that file, learns what "normal"
 looks like for each process (Isolation Forest), and writes an alert
 whenever a process starts behaving unlike its own baseline.
 
-Run it in a second terminal, next to the daemon:
+Run it in a second terminal alongside the daemon:
 
-    python3 ml/anomaly_detector.py --log logs/metrics.json --alerts logs/alerts.log
+    .venv/bin/python ml/anomaly_detector.py --log logs/metrics.json --alerts logs/alerts.log
 """
 
 import argparse
@@ -18,36 +18,43 @@ import time
 from sklearn.ensemble import IsolationForest
 
 # How many readings of a process we collect before training its model.
-# At one reading every 5 seconds, 100 readings ~= 8 minutes of baseline.
+# At one reading every 5 seconds, 100 readings = ~8 minutes of baseline.
+# We need enough data so the model learns the "normal" range, not just noise.
 BASELINE_SIZE = 100
 
 # Only alert if the anomaly score is below this threshold.
-# Scores range from ~0 (barely anomalous) to -0.5 (very anomalous).
-# -0.05 cuts out the noise — only genuinely unusual behavior gets flagged.
+# decision_function() gives scores: close to 0 = borderline, negative = anomalous.
+# -0.05 cuts out noise — only genuinely unusual behavior gets flagged.
+# Without this, the model raises alerts on tiny fluctuations too.
 SCORE_THRESHOLD = -0.05
 
-# kernel threads and interrupt handlers — not useful to monitor,
-# they show up as noise. Any process whose name starts with one of
-# these prefixes is silently skipped.
+# Kernel threads look like processes but they're OS internals, not real apps.
+# They always show "weird" metrics which would flood the detector with false alerts.
+# We skip them entirely by checking if the process name starts with these prefixes.
 KERNEL_PREFIXES = (
     "irq/", "kworker/", "ksoftirqd/", "migration/", "idle_inject/",
     "cpuhp/", "kthread", "rcu_", "UVM ", "nvidia-drm/", "card2-",
     "nvidia-modeset/", "vidmem", "pool_workqueue",
 )
 
-# user-space processes that are permanently noisy on this machine
-# (their anomaly scores are always borderline due to variable behavior)
+# Some user-space processes are permanently noisy on this machine
+# (their behavior changes so randomly that any model flags them constantly).
 IGNORE_PROCESSES = {"dbus-daemon", "dbus"}
 
 
 def make_features(row, prev):
-    """Turn one JSON reading into the numeric list the model sees.
+    """Turn one JSON reading into the numeric list the ML model sees.
 
-    cpu_delta / mem_delta capture *sudden change*, which matters as much
-    as the absolute value — jumping from 5% to 60% CPU is suspicious
-    even if 60% on its own might be fine for some processes.
+    We use 7 numbers to describe a process at one point in time:
+      - cpu_percent, memory_rss_mb, disk_read_bytes, disk_write_bytes,
+        open_connections: the raw values at this moment
+      - cpu_delta, mem_delta: how much these changed since the last reading
+
+    Why deltas? A jump from 5% to 60% CPU is suspicious even if 60% alone
+    might be normal for some processes. The delta captures sudden change,
+    which is often the real signal of anomalous behavior.
     """
-    cpu_delta = row["cpu_percent"] - prev["cpu_percent"] if prev else 0.0
+    cpu_delta = row["cpu_percent"]   - prev["cpu_percent"]   if prev else 0.0
     mem_delta = row["memory_rss_mb"] - prev["memory_rss_mb"] if prev else 0.0
     return [
         row["cpu_percent"],
@@ -61,12 +68,13 @@ def make_features(row, prev):
 
 
 def follow(path):
-    """Yield lines from the file forever, like `tail -f`.
+    """Yield new lines from the file forever, like `tail -f` in a terminal.
 
-    Starts from the beginning, so data collected before we launched
-    still counts toward the baseline. When there's nothing new, wait
-    a bit and try again.
+    Starts from the beginning of the file, so data collected before we
+    launched still counts toward the baseline. When there's nothing new,
+    we wait a bit and try again — this gives us live streaming from a file.
     """
+    # wait for the file to appear (the daemon might not have started yet)
     while True:
         try:
             f = open(path)
@@ -79,16 +87,17 @@ def follow(path):
         while True:
             line = f.readline()
             if line:
-                yield line
+                yield line      # new data — send it to whoever called follow()
             else:
-                time.sleep(2)  # daemon hasn't written anything new yet
+                time.sleep(2)   # no new data yet — wait and try again
 
 
 def write_alert(alerts_path, row, score):
-    """Append one alert line and echo it to the console.
+    """Append one alert line to the alerts file and print it to the console.
 
-    The score comes from decision_function(): more negative = the model
-    is more confident this reading is an outlier.
+    The score comes from decision_function():
+      - close to 0  = barely anomalous (filtered out by SCORE_THRESHOLD)
+      - around -0.5 = the model is very confident this is an outlier
     """
     line = (
         f"[ALERT] {row['timestamp']} | {row['name']} (pid {row['pid']}) | "
@@ -102,53 +111,60 @@ def write_alert(alerts_path, row, score):
 
 def main():
     parser = argparse.ArgumentParser(description="Isolation Forest anomaly detector")
-    parser.add_argument("--log", default="logs/metrics.json")
+    parser.add_argument("--log",    default="logs/metrics.json")
     parser.add_argument("--alerts", default="logs/alerts.log")
     args = parser.parse_args()
 
-    baselines = {}  # process name -> feature rows collected so far
-    models = {}     # process name -> its trained IsolationForest
-    prev_row = {}   # process name -> previous reading (for the deltas)
+    baselines = {}  # process name -> list of feature rows collected before model is ready
+    models    = {}  # process name -> its trained IsolationForest (after BASELINE_SIZE readings)
+    prev_row  = {}  # process name -> previous reading (needed to compute cpu_delta, mem_delta)
 
     print(f"reading {args.log}, alerts go to {args.alerts}")
     print(f"each process needs {BASELINE_SIZE} readings before detection starts\n")
 
     for line in follow(args.log):
+        # parse the JSON line that the C++ daemon wrote
         try:
             row = json.loads(line)
         except json.JSONDecodeError:
-            continue  # half-written line, the daemon is mid-write — skip
+            continue  # daemon was mid-write when we read — skip this incomplete line
 
         name = row["name"]
 
-        # skip kernel threads and permanently noisy system processes
+        # skip kernel threads — they are OS internals, not real user applications
         if any(name.startswith(p) for p in KERNEL_PREFIXES):
             continue
         if name in IGNORE_PROCESSES:
             continue
 
+        # build the 7-number feature vector for this reading
         features = make_features(row, prev_row.get(name))
-        prev_row[name] = row
+        prev_row[name] = row  # save for next reading's delta calculation
 
         if name in models:
-            # score first — decision_function gives a continuous value,
-            # more negative = more anomalous. We use the score directly
-            # rather than predict() so we can apply our own threshold.
+            # Model is trained — score this reading.
+            # We use decision_function() instead of predict() because it gives
+            # a continuous score, letting us tune sensitivity with SCORE_THRESHOLD.
+            # predict() only gives -1 or +1, which is too coarse.
             score = models[name].decision_function([features])[0]
             if score < SCORE_THRESHOLD:
                 write_alert(args.alerts, row, score)
         else:
-            # Still collecting this process's baseline.
+            # Still collecting baseline data for this process.
+            # We wait for BASELINE_SIZE readings before training —
+            # fewer readings would give a model that just memorizes noise.
             baselines.setdefault(name, []).append(features)
+
             if len(baselines[name]) >= BASELINE_SIZE:
+                # enough data — train the Isolation Forest now
                 model = IsolationForest(
-                    n_estimators=100,
-                    contamination=0.01,  # only 1% of baseline treated as anomalous
-                    random_state=42,
+                    n_estimators=100,   # number of trees — more = more stable decisions
+                    contamination=0.01, # assume only 1% of baseline was already anomalous
+                    random_state=42,    # fixed seed so results are reproducible
                 )
                 model.fit(baselines[name])
                 models[name] = model
-                del baselines[name]  # raw rows aren't needed anymore
+                del baselines[name]  # raw rows no longer needed — free the memory
                 print(f"baseline trained for '{name}' "
                       f"({BASELINE_SIZE} readings, watching it now)")
 

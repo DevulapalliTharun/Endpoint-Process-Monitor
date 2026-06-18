@@ -1,14 +1,14 @@
 // endpoint-monitor
 //
-// A small daemon that watches every process on the machine and logs
-// its CPU / memory / disk / network activity as JSON every few seconds.
-// The Python script in ml/ reads that log and flags anomalies.
+// A daemon that watches every process on the machine and logs its
+// CPU / memory / disk / network activity as JSON every few seconds.
+// A Python sidecar (ml/anomaly_detector.py) reads that log and flags anomalies.
 //
 // Usage:
-//   ./monitor                          run the daemon (5s interval)
-//   ./monitor --interval 10            custom sampling interval
-//   ./monitor --output logs/m.json     custom log path
-//   ./monitor --status                 one-shot table of all processes
+//   ./monitor                          run the daemon (5s interval, default)
+//   ./monitor --interval 10            custom sampling interval in seconds
+//   ./monitor --output logs/m.json     custom log file path
+//   ./monitor --status                 one-shot table of all processes, sorted by CPU
 //   ./monitor --process chrome         show only processes matching a name
 //   ./monitor --alerts                 print the last 10 anomaly alerts
 
@@ -25,24 +25,28 @@
 #include <thread>
 #include <chrono>
 
-// Takes two snapshots one second apart. CPU% is a rate — it needs a
-// "before" and an "after" to mean anything, so a single read won't do.
+// Takes two process snapshots exactly 1 second apart and returns the second one.
+// We need two reads because CPU% is a rate — you can't know how fast something
+// is going without measuring it at two points in time.
+// (Same reason a speedometer needs time to compute speed, not just distance.)
 static std::vector<ProcessInfo> take_snapshot(ProcessReader& reader) {
-    reader.read_all();  // warm-up read, values are all zero
+    reader.read_all();  // first read: stores baseline tick counts, CPU% comes back 0
     std::this_thread::sleep_for(std::chrono::seconds(1));
-    return reader.read_all();
+    return reader.read_all();  // second read: now CPU% = (new ticks - old ticks) / 1 second
 }
 
-// Prints processes as a table, highest CPU first. If `filter` is given,
-// only names containing that text are shown.
+// Prints all processes as a table, sorted by CPU% (highest first).
+// If `filter` is given, only process names containing that string are shown.
 static void print_table(std::vector<ProcessInfo> procs,
                         const std::map<int, int>& conns,
                         const std::string& filter = "") {
+    // sort so the most CPU-hungry process appears at the top
     std::sort(procs.begin(), procs.end(),
               [](const ProcessInfo& a, const ProcessInfo& b) {
                   return a.cpu_percent > b.cpu_percent;
               });
 
+    // print header row
     std::cout << std::left
               << std::setw(8)  << "PID"
               << std::setw(22) << "NAME"
@@ -53,16 +57,18 @@ static void print_table(std::vector<ProcessInfo> procs,
 
     int shown = 0;
     for (const auto& p : procs) {
+        // skip processes that don't match the optional filter
         if (!filter.empty() && p.name.find(filter) == std::string::npos)
             continue;
 
+        // look up connection count — 0 if we couldn't read it (permission)
         int c = 0;
         auto it = conns.find(p.pid);
         if (it != conns.end()) c = it->second;
 
         std::cout << std::left << std::fixed << std::setprecision(1)
                   << std::setw(8)  << p.pid
-                  << std::setw(22) << p.name.substr(0, 20)
+                  << std::setw(22) << p.name.substr(0, 20)  // truncate very long names
                   << std::setw(8)  << p.cpu_percent
                   << std::setw(10) << p.memory_rss_mb
                   << std::setw(7)  << c << "\n";
@@ -75,7 +81,8 @@ static void print_table(std::vector<ProcessInfo> procs,
         std::cout << "(" << shown << " processes)\n";
 }
 
-// Prints the last 10 lines of the alerts file.
+// Reads the last 10 lines from the alerts log and prints them.
+// If the file doesn't exist yet, it means the anomaly detector hasn't run.
 static void show_alerts(const std::string& path) {
     std::ifstream file(path);
     if (!file) {
@@ -85,11 +92,12 @@ static void show_alerts(const std::string& path) {
         return;
     }
 
+    // use a deque as a sliding window — keep only the last 10 lines
     std::deque<std::string> last;
     std::string line;
     while (std::getline(file, line)) {
         last.push_back(line);
-        if (last.size() > 10) last.pop_front();
+        if (last.size() > 10) last.pop_front();  // drop the oldest when we exceed 10
     }
 
     if (last.empty()) {
@@ -99,8 +107,13 @@ static void show_alerts(const std::string& path) {
     for (const auto& l : last) std::cout << l << "\n";
 }
 
-// The main daemon loop: sample everything, append to the JSON log,
-// sleep, repeat — until Ctrl+C.
+// The core daemon loop: wake up every `interval` seconds, read all process
+// stats, write them to the JSON log, and go back to sleep — forever.
+//
+// Why the warm-up read before the loop?
+// CPU% is a delta (change over time). Without a previous reading, the first
+// snapshot would report 0% for everything. The warm-up read creates that
+// "previous reading" so the first logged snapshot has real numbers.
 static void run_daemon(int interval, const std::string& output) {
     ProcessReader reader;
     NetworkTracker tracker;
@@ -109,19 +122,18 @@ static void run_daemon(int interval, const std::string& output) {
               << "  sampling every " << interval << "s -> " << output << "\n"
               << "  press Ctrl+C to stop\n\n";
 
-    // first read is a warm-up: CPU% needs two samples to compute,
-    // so we don't log this one (it would be all zeros)
+    // warm-up: establishes baseline tick counts so CPU% works on first real read
     reader.read_all();
 
     while (true) {
         std::this_thread::sleep_for(std::chrono::seconds(interval));
 
-        auto procs = reader.read_all();
-        auto conns = tracker.count_connections();
-        write_metrics(output, procs, conns);
+        auto procs = reader.read_all();          // Layer 1: CPU, memory, disk
+        auto conns = tracker.count_connections(); // Layer 2: network connections
+        write_metrics(output, procs, conns);      // Layer 3: write to JSON log
 
-        // endl (not \n) so the message shows up immediately even when
-        // stdout is piped or redirected
+        // std::endl flushes the buffer — without it, output might not appear
+        // if stdout is piped to another program
         std::cout << "[" << now_string() << "] logged "
                   << procs.size() << " processes" << std::endl;
     }
@@ -141,13 +153,15 @@ static void print_help() {
 
 int main(int argc, char* argv[]) {
     int interval = 5;
-    std::string output = "logs/metrics.json";
+    std::string output      = "logs/metrics.json";
     std::string alerts_path = "logs/alerts.log";
 
+    // mode decides what main() does after parsing arguments
     enum class Mode { Daemon, Status, Alerts, Process };
     Mode mode = Mode::Daemon;
     std::string process_filter;
 
+    // simple argument parser — no external library needed for this few flags
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
         if (arg == "--status") {
@@ -156,7 +170,7 @@ int main(int argc, char* argv[]) {
             mode = Mode::Alerts;
         } else if (arg == "--process" && i + 1 < argc) {
             mode = Mode::Process;
-            process_filter = argv[++i];
+            process_filter = argv[++i];  // consume the next argument as the filter
         } else if (arg == "--interval" && i + 1 < argc) {
             interval = std::stoi(argv[++i]);
         } else if (arg == "--output" && i + 1 < argc) {
@@ -171,6 +185,7 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // route to the right behavior based on mode
     if (mode == Mode::Alerts) {
         show_alerts(alerts_path);
         return 0;
@@ -179,12 +194,13 @@ int main(int argc, char* argv[]) {
     if (mode == Mode::Status || mode == Mode::Process) {
         ProcessReader reader;
         NetworkTracker tracker;
-        auto procs = take_snapshot(reader);
+        auto procs = take_snapshot(reader);       // two reads, 1s apart
         auto conns = tracker.count_connections();
         print_table(procs, conns, process_filter);
         return 0;
     }
 
+    // default: run as daemon until Ctrl+C
     run_daemon(interval, output);
     return 0;
 }
